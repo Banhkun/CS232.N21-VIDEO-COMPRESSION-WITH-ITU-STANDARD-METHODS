@@ -23,13 +23,14 @@ Development environment: Python3
 Setup Python Library:
 
 ```shell
+git clone https://github.com/Banhkun/CS232.N21-VIDEO-COMPRESSION-WITH-ITU-STANDARD-METHODS
 pip install -r requirements
 ```
 
 Command to run:
 
 ```shell
-python .\main__.py --src Dance.yuv --size 640x360 --fps 30 --dst Dance.avi
+python .\H2xx.py --src [Video name].yuv --size [height of the video]x[width of the video] --fps 30 --dst [Source name].avi
 ```
 
 - src: file path of the source video (in the .yuv format)
