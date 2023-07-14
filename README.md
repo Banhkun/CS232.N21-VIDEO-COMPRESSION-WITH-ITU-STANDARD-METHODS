@@ -12,7 +12,7 @@ This repository stores our solutions for all problems in the CS232.N21 - Multime
 |:---:| :-----------:     | :--:       | :--: 
 |1    |    [Đinh Nhật Minh](https://github.com/Banhkun/)      |  20521597  | Developer
 |2    |    [Lê Việt Thịnh](https://github.com/levietthinh/)    |  20520781  | Commander
-|3    |    [Vương Vĩnh thuận]    |  20521997  | Ấter
+|3    |    Vương Vĩnh thuận    |  20521997  | Ấter
 
 
 # Code execution
