@@ -4,7 +4,7 @@
 
 # Introduction
 
-This repository stores our solutions for all problems in the CS519.M11 - Scientific Research Methodology 
+This repository stores our solutions for all problems in the CS232.N21 - Multimedia 
 
 ## Member
 
