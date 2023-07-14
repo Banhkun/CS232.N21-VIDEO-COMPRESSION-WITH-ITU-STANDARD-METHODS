@@ -1,0 +1,1047 @@
+import argparse
+from concurrent.futures import wait
+import cv2 as cv
+import numpy as np
+from itertools import product
+from math import sqrt, cos, pi
+from scipy.fft import dctn, idctn
+import matplotlib.pyplot as plt
+from dahuffman import HuffmanCodec
+import math
+import datetime
+import numba
+
+@numba.jit
+def extractYUV(file_name, height, width):
+    """
+    Extracts the Y, U, and V components of the frames in the given video file.
+    :param file_name: filepath of video file to extract frames from.
+    :param height: height of video.
+    :param width: width of video.
+    :param start_frame: first frame to be extracted.
+    :param end_frame: final frame to be extracted.
+    :
+    """
+
+    fp = open(file_name, 'rb')
+    fp.seek(0, 2)  # Seek to end of file
+    fp_end = fp.tell()  # Find the file size
+
+    frame_size = height * width * 3 // 2  # Size of a frame in bytes
+    num_frame = fp_end // frame_size  # Number of frames in the video
+    print("This yuv file has {} frame imgs!".format(num_frame))
+    fp.seek(0, 0)  # Seek to the start of the first frame
+
+    YUV = []
+    for i in range(num_frame):
+        yuv = np.zeros(shape=frame_size, dtype='uint8', order='C')
+        for j in range(frame_size):
+            yuv[j] = ord(fp.read(1))  # Read one byte from the file
+
+        img = yuv.reshape((height * 3 // 2, width)).astype('uint8')  # Reshape the array    
+        
+        # YUV420
+        y = np.zeros((height, width), dtype='uint8', order='C')
+        u = np.zeros((height // 2) * (width // 2), dtype='uint8', order='C')
+        v = np.zeros((height // 2) * (width // 2), dtype='uint8', order='C')
+        
+        # assignment
+        y = img[:height, :width]
+        u = img[height : height * 5 // 4, :width]
+        v = img[height * 5 // 4 : height * 3 // 2, :width]
+
+        # reshape
+        u = u.reshape((height // 2, width // 2)).astype('uint8')
+        v = v.reshape((height // 2, width // 2)).astype('uint8')
+
+        # save
+        YUV.append({'y': y, 'u': u, 'v': v})
+
+
+    fp.close()
+    print("job done!")
+    return YUV, num_frame
+
+@numba.jit
+def YUV2RGB(y, u, v, height, width):
+    '''
+    Converts YUV to RGB.
+    :param y: Y component.
+    :param u: U component.
+    :param v: V component.
+    :param height: height of image.
+    :param width: width of image.
+    :return: RGB components.
+    '''
+    yuv = np.zeros((height * 3 // 2, width), dtype='uint8', order='C')
+    y = y.reshape((height, width))
+    u = u.reshape((-1, width))
+    v = v.reshape((-1, width))
+    yuv[:height, :width] = y
+    yuv[height : height*5//4, :width] = u
+    yuv[height*5//4 : height*3//2, :width] = v
+    rgb = cv.cvtColor(yuv, cv.COLOR_YUV2BGR_I420)  
+    return rgb
+
+@numba.jit
+def motionEstimation(y_curr, y_ref, u_ref, v_ref, width, height):
+    h_num = math.ceil(height / 16)
+    w_num = math.ceil(width / 16)
+    size = h_num * w_num
+    MotionVector_arr = np.zeros((2, size,4)).astype(float)  # Use float for sub-pixel accuracy
+    MotionVector_subarr = np.zeros((2, size,4)).astype(float)  # Use float for sub-pixel accuracy
+    y_pred = np.zeros((height, width))
+    u_pred = np.zeros((height // 2, width // 2))
+    v_pred = np.zeros((height // 2, width // 2))
+    CoMatrix = np.zeros((4, size))
+    mv_row = 0 
+    mv_col = 0
+    sub_row = 0
+    sub_col = 0
+    # Different location has different search size
+    SearchWindow_dict = {
+        576: 81,
+        768: 153,
+        1024: 289
+    }
+    Sub_SearchWindow_dict = {
+        144: 25,   # 12x12: maximum 64 blocks (8x8 grid)
+        192: 45,   # 12x16: maximum 80 blocks (8x10 grid)
+        256: 81,  # 16x16: maximum 100 blocks (10x10 grid)
+    }
+    # Refine the motion vector with half-pixel accuracy
+    half_pixel_offset_row = 0.0
+    half_pixel_offset_col = 0.0
+    quarter_pixel_search_range = 0.25  # Adjust the range as needed
+    half_pixel_search_range = 0.5  # Adjust the range as needed
+    # For each macroblock in the frame:
+    mv_idx = 0
+    for n, m in product(range(0, height, 16), range(0, width, 16)):
+        MB_curr = y_curr[n:n + 16, m:m + 16]  # Current macroblock.
+
+        # Identify search window parameters. For 8 px in each direction, we can have search windows of sizes 24x24,
+        # 24x32, 32x24, or 32x32.
+        SW_hmin = 0 if n - 8 < 0 else n - 8
+        SW_wmin = 0 if m - 8 < 0 else m - 8
+        SW_hmax = height if n + 16 + 8 > height else n + 16 + 8
+        SW_wmax = width if m + 16 + 8 > width else m + 16 + 8
+
+        SW_x = SW_wmax - SW_wmin
+        SW_y = SW_hmax - SW_hmin
+        SW_size = int(SW_x * SW_y)
+
+        # Number of candidate blocks == SearchArea.
+        SearchArea = 0
+        for x, y in SearchWindow_dict.items():
+            if x == SW_size:
+                SearchArea = y
+                break
+        SA_vect = np.zeros(SearchArea)
+        SA_arr = np.zeros((2, SearchArea)).astype(int)  # Use float for sub-pixel accuracy
+        for i in range(SearchArea):
+            SA_vect[i] = 99999.0
+            SA_arr[0, i] = -1  # Use float for sub-pixel accuracy
+            SA_arr[1, i] = -1  # Use float for sub-pixel accuracy
+
+        # Go through the designated search window for the current macroblock.
+        SW_tmp = 0
+        for i, j in product(range(SW_hmin, SW_hmax - 15), range(SW_wmin, SW_wmax - 15)):
+            MB_temp = y_ref[i:i + 16, j:j + 16]
+            if MB_curr.shape[0] != 16 or MB_curr.shape[1] != 16:
+                pass
+            else:
+                diff = np.float32(MB_curr) - np.float32(MB_temp)
+                SA_vect[SW_tmp] = np.sum(np.abs(diff))
+                SA_arr[0, SW_tmp] = i
+                SA_arr[1, SW_tmp] = j
+                SW_tmp += 1
+
+
+        if MB_curr.shape[0] != 16 or MB_curr.shape[1] != 16:
+            pass
+        else:
+            # Get minimum SAD (sum of absolute differences) and search for its corresponding microblock.
+            SAD_min = min(SA_vect)
+            if SAD_min >2000:
+                sub_block_idx = 0
+                for p, q in product(range(n, n+16, 8), range(m, m+16, 8)):
+                    # This is for each 8x8 sub-block
+                    Sub_MB_curr = y_curr[p:p + 8, q:q + 8]
+
+                    # Identify search window parameters. For 4 px in each direction, we can have search windows of sizes 16x16,
+                    # 16x20, 20x16, or 20x20.
+                    Sub_SW_hmin = 0 if p - 4 < 0 else p - 4
+                    Sub_SW_wmin = 0 if q - 4 < 0 else q - 4
+                    Sub_SW_hmax = height if p + 8 + 4 > height else p + 8 + 4
+                    Sub_SW_wmax = width if q + 8 + 4 > width else q + 8 + 4
+
+                    Sub_SW_x = Sub_SW_wmax - Sub_SW_wmin
+                    Sub_SW_y = Sub_SW_hmax - Sub_SW_hmin
+                    Sub_SW_size = int(Sub_SW_x * Sub_SW_y)
+
+                    # Number of candidate blocks == Sub_SearchArea.
+                    Sub_SearchArea = 0
+                    for x, y in Sub_SearchWindow_dict.items():
+                        if x == Sub_SW_size:
+                            Sub_SearchArea = y
+                            break
+                    Sub_SA_vect = np.zeros(Sub_SearchArea)
+                    Sub_SA_arr = np.zeros((2, Sub_SearchArea)).astype(int) 
+
+                    # Go through the designated search window for the current 8x8 sub-block.
+                    Sub_SW_tmp = 0
+                    for i, j in product(range(Sub_SW_hmin, Sub_SW_hmax - 7), range(Sub_SW_wmin, Sub_SW_wmax - 7)):
+                        Sub_MB_temp = y_ref[i:i + 8, j:j + 8]
+                        if Sub_MB_curr.shape[0] != 8 or Sub_MB_curr.shape[1] != 8:
+                            pass
+                        else:
+                            diff = np.float32(Sub_MB_curr) - np.float32(Sub_MB_temp)
+                            Sub_SA_vect[Sub_SW_tmp] = np.sum(np.abs(diff))
+                            Sub_SA_arr[0, Sub_SW_tmp] = i
+                            Sub_SA_arr[1, Sub_SW_tmp] = j
+                            Sub_SW_tmp += 1
+
+                    # Get minimum SAD for the 8x8 sub-block
+                    SAD_min_8x8 = min(Sub_SA_vect)
+                    for i in range(Sub_SearchArea):
+                        if Sub_SA_vect[i] == SAD_min_8x8:
+                            mv_row = Sub_SA_arr[0, i]
+                            mv_col = Sub_SA_arr[1, i]
+                            sub_row = Sub_SA_arr[0, i] 
+                            sub_col = Sub_SA_arr[1, i]
+                            break
+
+                    # Refine the motion vector of 8x8 sub-block with half-pixel accuracy
+                    for half_row in [-half_pixel_search_range,-quarter_pixel_search_range, 0.0,quarter_pixel_search_range, half_pixel_search_range]:
+                        for half_col in [-half_pixel_search_range,-quarter_pixel_search_range, 0.0,quarter_pixel_search_range, half_pixel_search_range]:
+                            ref_row = mv_row + half_row
+                            ref_col = mv_col + half_col
+                            Sub_MB_temp = np.zeros((8, 8))
+                            for i in range(8):
+                                for j in range(8):
+                                    interpolated_value = bilinear_interpolation(y_ref, ref_col + j, ref_row + i)
+                                    Sub_MB_temp[i, j] = interpolated_value
+                            if Sub_MB_temp.shape[0] != 8 or Sub_MB_temp.shape[1] != 8:
+                                continue
+                            diff = np.float32(Sub_MB_curr) - np.float32(Sub_MB_temp)
+                            SAD = np.sum(np.abs(diff))
+                            if SAD < SAD_min_8x8:
+                                SAD_min_8x8 = SAD
+                                mv_row = ref_row
+                                mv_col = ref_col
+                                half_pixel_offset_row = half_row
+                                half_pixel_offset_col = half_col
+
+                    # Store the motion vectors for the 8x8 sub-block.
+                    # Now we can directly store each sub-block's motion vector in its corresponding slot in the third dimension.
+                    MotionVector_arr[0, mv_idx, sub_block_idx] = mv_row - p
+                    MotionVector_arr[1, mv_idx, sub_block_idx] = mv_col - q
+                    MotionVector_subarr[0, mv_idx,sub_block_idx] = int((sub_row - p) // 2)+ half_pixel_offset_row
+                    MotionVector_subarr[1, mv_idx,sub_block_idx] = int((sub_col - q) // 2)+ half_pixel_offset_col
+                    for i in range(8):
+                        for j in range(8):
+                            interpolated_value = bilinear_interpolation(y_ref, mv_col + j, mv_row + i)
+                            y_pred[p + i, q + j] = np.float32(interpolated_value)
+                    sub_block_idx += 1  # Move to the next 8x8 sub-block within the 16x16 block
+            else: 
+                for i in range(SearchArea):
+                    if SA_vect[i] == SAD_min:
+                        mv_row = SA_arr[0, i]
+                        mv_col = SA_arr[1, i]
+                        sub_row = SA_arr[0, i]  
+                        sub_col = SA_arr[1, i]
+                        break
+                for half_row in [-half_pixel_search_range,-quarter_pixel_search_range, 0.0,quarter_pixel_search_range, half_pixel_search_range]:
+                    for half_col in [-half_pixel_search_range,-quarter_pixel_search_range, 0.0,quarter_pixel_search_range, half_pixel_search_range]:
+                        ref_row = mv_row + half_row
+                        ref_col = mv_col + half_col
+                        MB_temp = np.zeros((16, 16))
+                        for i in range(16):
+                            for j in range(16):
+                                interpolated_value = bilinear_interpolation(y_ref, ref_col + j, ref_row + i)
+                                MB_temp[i, j] = interpolated_value
+                        if MB_temp.shape[0] != 16 or MB_temp.shape[1] != 16:
+                            continue
+                        diff = np.float32(MB_curr) - np.float32(MB_temp)
+                        SAD = np.sum(np.abs(diff))
+                        if SAD < SAD_min and (half_row != 0.0 or half_col != 0.0):
+                            SAD_min = SAD
+                            mv_row = ref_row
+                            mv_col = ref_col
+                            half_pixel_offset_row = half_row
+                            half_pixel_offset_col = half_col
+
+                
+                # The coordinates give the top-left pixel + the motion vector coordinates dx and dy.
+                MotionVector_arr[0, mv_idx] = mv_row - n
+                MotionVector_arr[1, mv_idx] = mv_col - m
+
+                # Store the half-pixel offsets
+                MotionVector_subarr[0, mv_idx] = int((sub_row - n) // 2) + half_pixel_offset_row
+                MotionVector_subarr[1, mv_idx] = int((sub_col - m) // 2) + half_pixel_offset_col
+                # Use bilinear interpolation for half-pixel accuracy prediction
+                for i in range(16):
+                    for j in range(16):
+                        interpolated_value = bilinear_interpolation(y_ref, mv_col + j, mv_row + i)
+                        y_pred[n + i, m + j] = np.float32(interpolated_value)
+
+                # Get motion vector inputs for quiver().
+                CoMatrix[0, mv_idx] = m
+                CoMatrix[1, mv_idx] = n
+                CoMatrix[2, mv_idx] = mv_col - m
+                CoMatrix[3, mv_idx] = mv_row - n
+
+                mv_idx += 1
+    # Reconstruct u/v.
+    uv_idx = 0
+    for i, j in product(range(0, height // 2, 8), range(0, width // 2, 8)):
+        if i + 8 > (height//2):
+            u_pred[i:height//2,j:j+8] = np.float32(u_ref[i:height//2,j:j+8])
+            v_pred[i:height//2,j:j+8] = np.float32(v_ref[i:height//2,j:j+8])
+        else:
+            sub_block_idx = 0
+            if MotionVector_subarr[0, uv_idx, sub_block_idx] is not None:
+                for p, q in product(range(i, i+8, 4), range(j, j+8, 4)):
+                    print(sub_block_idx)
+                    ref_row = p + MotionVector_subarr[0, uv_idx, sub_block_idx]
+                    ref_col = q + MotionVector_subarr[1, uv_idx, sub_block_idx]
+                    for k in range(8):
+                        for l in range(8):
+                            interpolated_u_value = bilinear_interpolation(u_ref, ref_col+k, ref_row+l)
+                            interpolated_v_value = bilinear_interpolation(v_ref, ref_col+k, ref_row+l)
+                            u_pred[i+k-1, j + l-1] = np.float32(interpolated_u_value)
+                            v_pred[i + k-1, j + l-1] = np.float32(interpolated_v_value)
+                    sub_block_idx += 1
+                        
+            else:  # If there are no sub-blocks, handle the whole macroblock at once
+                ref_row = i + MotionVector_arr[0, uv_idx]
+                ref_col = j + MotionVector_arr[1, uv_idx]
+                for k in range(16):
+                    for l in range(16):
+                        interpolated_u_value = bilinear_interpolation(u_ref, ref_col+k, ref_row+l)
+                        interpolated_v_value = bilinear_interpolation(v_ref, ref_col+k, ref_row+l)
+                        u_pred[i+k-1, j + l-1] = np.float32(interpolated_u_value)
+                        v_pred[i + k-1, j + l-1] = np.float32(interpolated_v_value)
+            uv_idx += 1
+            sub_block_idx += 1  # move to the next sub-block
+
+
+    return CoMatrix, MotionVector_arr, MotionVector_subarr, y_pred, u_pred, v_pred
+
+@numba.jit
+def bilinear_interpolation(image, x, y):
+    height, width = image.shape
+
+    x1 = int(x)
+    y1 = int(y)
+    x2 = x1 + 1
+    y2 = y1 + 1
+
+    if x2 >= width or y2 >= height:
+        return image[y1, x1]
+
+    Q11 = image[y1, x1]
+    Q12 = image[y2, x1]
+    Q21 = image[y1, x2]
+    Q22 = image[y2, x2]
+
+    dx = x - x1
+    dy = y - y1
+
+    interpolated_value = (1 - dx) * (1 - dy) * Q11 + dx * (1 - dy) * Q21 + (1 - dx) * dy * Q12 + dx * dy * Q22
+
+    return interpolated_value
+
+def quantize_block(block, QP, isInv=False, isI=True):
+    # Define the scale matrix (this is a simplified example, the actual scale matrix in H.264 is more complex)
+    scale_matrix_intra = np.array([
+        [16, 16, 16, 16],
+        [16, 16, 16, 16],
+        [16, 16, 16, 16],
+        [16, 16, 16, 16]
+    ])
+    scale_matrix_inter = np.array([
+        [16, 16, 16, 16],
+        [16, 16, 16, 20],
+        [16, 16, 24, 28],
+        [16, 20, 28, 32]
+    ])
+    scale_matrix = scale_matrix_intra if isI else scale_matrix_inter
+
+
+    # Calculate the quantization step from the QP
+    quant_step = 2 ** ((QP - 4) / 6)
+
+    # Perform quantization or its inverse depending on isInv flag.
+    if isInv:
+        # Inverse quantization: multiply by quant_step and divide by scale_matrix
+        quantized = (block * quant_step / scale_matrix).round().astype(np.int32)
+    else:
+        # Quantization: divide by quant_step and multiply by scale_matrix
+        quantized = (block / quant_step * scale_matrix).round().astype(np.int32)
+
+    return quantized
+
+
+@numba.jit
+def quantize(mat, width, height, QP=26, isInv=False, isI=True):
+    """Perform quantization or its inverse operation on a larger image."""
+    # Get the size of the image
+    height, width = mat.shape
+
+    # Initialize an empty array for the result
+    quantized = np.empty_like(mat)
+
+    # Iterate over the image in 4x4 blocks
+    for i in range(0, height, 4):
+        for j in range(0, width, 4):
+            # Extract the current 4x4 block
+            block = mat[i:i+4, j:j+4]
+            # Perform the quantization on the block and store the result
+            quantized[i:i+4, j:j+4] = quantize_block(block, QP, isInv, isI)
+
+    return quantized
+
+
+
+@numba.jit
+def extractCoefficients(mat, width, height):
+    '''
+    Extracts the DC and AC coefficients of the quantized 4x4 block within a frame and places it in a single row of a
+    coefficient matrix according to zigzag pattern.
+    :param mat: input image matrix.
+    :param width: width of image.
+    :param height: height of image.
+    :return: coefficent matrix with 16 DC and AC coefficents for column values, for each pixel of the 4x4 block.
+    '''
+    numRows = (height // 4) * (width // 4)  # No. of rows in coefficient matrix is number of 4x4 blocks in the image.
+    coeffMat = np.zeros((numRows, 16))
+    matIdx = np.array([0,  1,  5,  6,
+                    2,  4,  7,  12,
+                    3,  8,  11, 13,
+                    9, 10, 14, 15])
+    for N, M in product(range(0, height, 4), range(0, width, 4)):
+        if N >= height // 4*4 or M >= width // 4*4:
+            break
+        num = N // 4 * width // 4 + M // 4
+
+        coeffMat[num][matIdx] = mat[N:N+4, M:M+4].reshape(-1)
+
+    return coeffMat
+
+@numba.jit
+def IextractCoefficients(coeffMat,width,height):
+    """
+    :Reconstruct block
+    :param width: width of frame.
+    :param height: height of frame.
+    """
+    blockMat = np.zeros((height, width))
+    matIdx = np.array([0,  1,  5,  6,
+                    2,  4,  7,  12,
+                    3,  8,  11, 13,
+                    9, 10, 14, 15])
+    for N, M in product(range(0, height, 4), range(0, width, 4)):
+        if N >= height // 4*4 or M >= width // 4*4:
+            break
+        num = N // 4 * width // 4 + M // 4
+        blockMat[N:N+4, M:M+4] = coeffMat[num][matIdx].reshape((4,4))
+
+    return blockMat
+
+@numba.jit
+def getDC(CoeffMat):
+    '''
+    Computes DC coefficients for a given YUV component.
+    :param CoeffMat: YUV component.
+    :return: DC coefficients.
+    '''
+    dc_coeff = np.zeros(CoeffMat.shape[0])
+    dc_coeff = CoeffMat[:, 0]
+    dcdpcm = np.zeros(CoeffMat.shape[0])
+    dcdpcm[0] = dc_coeff[0]
+    dcdpcm[1:] = dc_coeff[1:] - dc_coeff[:-1]
+    return dc_coeff, dcdpcm
+
+@numba.jit
+def getAC(CoeffMat):
+    '''
+    Computes AC coefficients for a given YUV component using RLE
+    :param CoeffMat: YUV component.
+    :return: AC coefficients.
+    '''
+    ac_coeff = []
+    for i in range(CoeffMat.shape[0]):
+        "using the run length encoding algorithm"
+        cnt = 0
+        for x in CoeffMat[i, 1:]:
+            if x == 0:
+                cnt += 1
+            if x != 0:
+                ac_coeff.append((cnt, x))
+                cnt = 0
+        ac_coeff.append((0, 0))
+    return ac_coeff
+
+@numba.jit
+def huffmanCoding(data):
+    '''
+    Huffman coding for data.
+    :param data:data.
+    :return: Huffman coded and encode.
+    '''
+    codec = HuffmanCodec.from_data(data)
+    encode = codec.encode(data)
+    return codec, encode
+
+@numba.jit
+def MatDecode(dc_codec, dc_encode, ac_codec, ac_encode, num):
+    '''
+    Decodes DC and AC coefficients.
+    :param dc_codec: DC Huffman codec.
+    :param dc_encode: DC Huffman encoded coefficients.
+    :param ac_codec: AC Huffman codec.
+    :param ac_encode: AC Huffman encoded coefficients.
+    :return: Decoded DC and AC coefficients.
+    '''
+    dc_decode = HuffmanCodec.decode(dc_codec, dc_encode)
+    dc = np.zeros((num, ))
+    dc = dc_decode[:]
+    dc = np.cumsum(dc)
+    ac_decode = HuffmanCodec.decode(ac_codec, ac_encode)
+    Mat = np.zeros((num, 64))
+    Mat[:, 0] = dc
+    block = 0
+    cur = 1
+    for ac in ac_decode:
+        if ac == (0, 0):
+            Mat[block, cur : 64] = 0
+            block += 1
+            cur = 1
+        else:
+            cnt = ac[0]
+            Mat[block, cur : cur + cnt] = 0
+            Mat[block, cur + cnt] = ac[1]
+            cur += cnt + 1
+        
+    return Mat
+
+
+def flatten_2d_array(arr):
+    # Flatten a 2D array into a 1D sequence
+    return [item for sublist in arr for item in sublist]
+
+def reshape_1d_array(arr, shape):
+    # Reshape a 1D array into the specified shape
+    return np.reshape(arr, shape)
+
+# Define the H.264 transform matrix
+C = np.array([
+    [1,  1,  1,  1],
+    [2,  1, -1, -2],
+    [1, -1, -1,  1],
+    [1, -2,  2, -1]
+]) / 2
+
+def clip(x, min_val, max_val):
+    """Clip the values of x to the range [min_val, max_val]."""
+    return np.clip(x, min_val, max_val)
+
+def round_and_clip(x):
+    """Round the values of x to the nearest integer and clip to the range [0, 255]."""
+    return clip(np.round(x), 0, 255)
+
+def forward_integer_transform_by_block(block ):
+    """Perform the forward 4x4 integer transform."""
+    # Perform the transform and scale the result
+    result = C @ block @ C.T
+    result = result // 64
+    # Clip the values to the range [-2048, 2047]
+    return clip(result, -2048, 2047)
+
+def forward_integer_transform(image):
+    """Perform the forward 4x4 integer transform on a larger image."""
+    # Get the size of the image
+    height, width = image.shape
+
+    # Initialize an empty array for the result
+    result = np.empty_like(image)
+
+    # Iterate over the image in 4x4 blocks
+    for i in range(0, height, 4):
+        for j in range(0, width, 4):
+            # Extract the current 4x4 block
+            block = image[i:i+4, j:j+4]
+            # Perform the transform on the block and store the result
+            result[i:i+4, j:j+4] = forward_integer_transform_by_block(block)
+
+    return result
+
+def inverse_integer_transform_by_block(block):
+    """Perform the inverse 4x4 integer transform."""
+    # Scale the block and perform the transform
+    result = C.T @ (block * 64) @ C
+    # Round the values to the nearest integer and clip to the range [0, 255]
+    return round_and_clip(result)
+
+def inverse_integer_transform(image):
+    """Perform the inverse 4x4 integer transform on a larger image."""
+    # Get the size of the image
+    height, width = image.shape
+
+    # Initialize an empty array for the result
+    result = np.empty_like(image)
+
+    # Iterate over the image in 4x4 blocks
+    for i in range(0, height, 4):
+        for j in range(0, width, 4):
+            # Extract the current 4x4 block
+            block = image[i:i+4, j:j+4]
+            # Perform the transform on the block and store the result
+            result[i:i+4, j:j+4] = inverse_integer_transform_by_block(block)
+
+    return result
+
+
+def DC_prediction_block(block, left_neighbour, top_neighbour):
+    """
+    Performs DC prediction on a block using the boundary values of the left and top neighbours.
+
+    :param block: 4x4 block to be predicted.
+    :param left_neighbour: 4x1 block to the left of the current block.
+    :param top_neighbour: 1x4 block above the current block.
+    :return: predicted 4x4 block.
+    """
+    # check if block is of correct size
+    if block.shape != (4,4):
+        raise ValueError('Expected block of size 4x4, got {}'.format(block.shape))
+    
+    predicted_block = np.zeros((4,4), dtype=block.dtype)
+
+    # calculate average of left and above blocks
+    left = left_neighbour.mean()
+    above = top_neighbour.mean()
+
+    # fill predicted block with the average
+    predicted_block.fill((left + above) / 2)
+
+    return predicted_block
+
+
+def DC_prediction(image):
+    """
+    Performs DC prediction on an entire image by applying DC prediction to each block.
+
+    :param image: 2D array representing the image.
+    :return: predicted image.
+    """
+    # Get the shape of the image
+    height, width = image.shape
+
+    # Initialize the predicted image
+    predicted_image = np.zeros_like(image)
+
+    # Iterate over each block in the image
+    for i in range(0, height, 4):
+        for j in range(0, width, 4):
+            # Extract the current block
+            block = image[i:i+4, j:j+4]
+
+            # If the block is not 4x4, skip it
+            if block.shape != (4, 4):
+                continue
+
+            # Extract the neighboring blocks
+            left_neighbour = image[i:i+4, j-1] if j > 0 else np.zeros((4,))
+            top_neighbour = image[i-1, j:j+4] if i > 0 else np.zeros((4,))
+
+            # Perform DC prediction on the block
+            predicted_block = DC_prediction_block(block, left_neighbour, top_neighbour)
+
+            # Place the predicted block in the predicted image
+            predicted_image[i:i+4, j:j+4] = predicted_block
+
+    return predicted_image
+
+
+@numba.jit
+def encode(y, u, v, height, width,MV_arr, MV_sub_arr):
+    # Apply intra prediction
+    y_predicted = DC_prediction(y)
+    u_predicted = DC_prediction(u)
+    v_predicted = DC_prediction(v)
+
+    # Get residual blocks
+    y_residual = y - y_predicted
+    u_residual = u - u_predicted
+    v_residual = v - v_predicted
+
+    yDCT, uDCT, vDCT = forward_integer_transform(y_residual), forward_integer_transform(u_residual), forward_integer_transform(v_residual)
+
+    yQuant = quantize(yDCT, width, height, isI = False)
+    uQuant = quantize(uDCT, width // 2, height // 2, isI = False)
+    vQuant = quantize(vDCT, width // 2, height // 2, isI = False)
+
+    # Extract DC and AC coefficients; these would be transmitted to the decoder in a real MPEG
+    # encoder/decoder framework.
+    yCoeffMat = extractCoefficients(yQuant, width, height)
+    
+    dc_y, dpcm_y = getDC(yCoeffMat)
+    ac_y = getAC(yCoeffMat)
+    dccodec_y, dcencode_y = huffmanCoding(dpcm_y)
+    accodec_y, acencode_y = huffmanCoding(ac_y)
+    y_encoded = [dccodec_y,dcencode_y,accodec_y,acencode_y,yCoeffMat]
+    
+    uCoeffMat = extractCoefficients(uQuant, width // 2, height // 2)
+    dc_u, dpcm_u = getDC(uCoeffMat)
+    ac_u = getAC(uCoeffMat)
+    dccodec_u, dcencode_u = huffmanCoding(dpcm_u)
+    accodec_u, acencode_u = huffmanCoding(ac_u)
+    u_encoded = [dccodec_u,dcencode_u,accodec_u,acencode_u,uCoeffMat]
+
+    vCoeffMat = extractCoefficients(vQuant, width // 2, height // 2)
+    dc_v, dpcm_v = getDC(vCoeffMat)
+    ac_v = getAC(vCoeffMat)
+    dccodec_v, dcencode_v = huffmanCoding(dpcm_v)
+    accodec_v, acencode_v= huffmanCoding(ac_v)
+    v_encoded = [dccodec_v,dcencode_v,accodec_v,acencode_v,vCoeffMat] 
+
+
+    mvcodec, mvencode= huffmanCoding(MV_arr.flatten())
+    mv_encoded = [mvcodec,mvencode]
+
+    mvsubcodec, mvsubencode= huffmanCoding(MV_sub_arr.flatten())
+    mv_sub_encoded = [mvsubcodec,mvsubencode]
+    
+    return  y_encoded,u_encoded,v_encoded,mv_encoded,mv_sub_encoded
+
+
+@numba.jit
+def decode(height, width, y_encoded, u_encoded, v_encoded, mv_encoded, mv_sub_encoded):
+    # Your existing decode code...
+# Calculate the size of each encoded data
+    mvcodec,mvencode=mv_encoded[0],mv_encoded[1]
+    mvsubcodec,mvsubencode=mv_sub_encoded[0],mv_sub_encoded[1]
+
+    dccodec_y, dcencode_y, accodec_y, acencode_y, yCoeffMat = y_encoded[0],y_encoded[1],y_encoded[2],y_encoded[3],y_encoded[4]
+    dccodec_v,dcencode_v,accodec_v,acencode_v,vCoeffMat = v_encoded[0],v_encoded[1],v_encoded[2],v_encoded[3],v_encoded[4]
+    dccodec_u,dcencode_u,accodec_u,acencode_u,uCoeffMat = u_encoded[0],u_encoded[1],u_encoded[2],u_encoded[3],u_encoded[4]
+    
+    # Perform inverse quantization.
+    # decoding
+    mv_decode = mvcodec.decode(mvencode)
+    mv_sub_decode = mvsubcodec.decode(mvsubencode)
+
+
+
+    YMatRecon = MatDecode(dccodec_y, dcencode_y, accodec_y, acencode_y, yCoeffMat.shape[0])
+    YQuantRecon = IextractCoefficients(YMatRecon, width, height)
+
+    vMatRecon = MatDecode(dccodec_v,dcencode_v,accodec_v,acencode_v,vCoeffMat.shape[0])
+    vQuantRecon = IextractCoefficients(vMatRecon,width//2,height//2)
+
+    uMatRecon = MatDecode(dccodec_u,dcencode_u,accodec_u,acencode_u,uCoeffMat.shape[0])
+    uQuantRecon = IextractCoefficients(uMatRecon,width//2,height//2)
+    # Perform inverse quantization
+    yIQuant = quantize(YQuantRecon, width, height, isInv=True, isI = False)
+    uIQuant = quantize(uQuantRecon, width // 2, height // 2, isInv=True, isI = False)
+    vIQuant = quantize(vQuantRecon, width // 2, height // 2, isInv=True, isI = False)
+
+    # Perform inverse DCT
+    y_residual = inverse_integer_transform(yIQuant)
+    u_residual = inverse_integer_transform(uIQuant)
+    v_residual = inverse_integer_transform(vIQuant)
+
+    # Initialize the reconstructed image
+    y_recon = np.zeros_like(y_residual)
+    u_recon = np.zeros_like(u_residual)
+    v_recon = np.zeros_like(v_residual)
+
+    # Iterate over each block in the image
+    for i in range(0, height, 4):
+        for j in range(0, width, 4):
+            # Extract the current block
+            y_block = y_residual[i:i+4, j:j+4]
+            u_block = u_residual[i:i+4, j:j+4]
+            v_block = v_residual[i:i+4, j:j+4]
+
+            # Extract the neighboring blocks
+            y_left_neighbour = y_recon[i:i+4, j-1] if j > 0 else np.zeros((4,))
+            y_top_neighbour = y_recon[i-1, j:j+4] if i > 0 else np.zeros((4,))
+            u_left_neighbour = u_recon[i:i+4, j-1] if j > 0 else np.zeros((4,))
+            u_top_neighbour = u_recon[i-1, j:j+4] if i > 0 else np.zeros((4,))
+            v_left_neighbour = v_recon[i:i+4, j-1] if j > 0 else np.zeros((4,))
+            v_top_neighbour = v_recon[i-1, j:j+4] if i > 0 else np.zeros((4,))
+
+            # Apply DC prediction and add residual
+            y_recon[i:i+4, j:j+4] = y_block + DC_prediction_block(np.zeros((4,4)), y_left_neighbour, y_top_neighbour)
+            u_recon[i:i+4, j:j+4] = u_block + DC_prediction_block(np.zeros((4,4)), u_left_neighbour, u_top_neighbour)
+            v_recon[i:i+4, j:j+4] = v_block + DC_prediction_block(np.zeros((4,4)), v_left_neighbour, v_top_neighbour)
+    
+    return y_recon, u_recon, v_recon, mv_decode, mv_sub_decode
+
+
+@numba.jit
+def encode_I(y, u, v, height, width):
+    '''
+    Encodes and decodes the YUV components.
+    :param y: YUV component.
+    :param u: YUV component.
+    :param v: YUV component.
+    :param height: Height of the image.
+    :param width: Width of the image.
+    :return: Encoded and decoded YUV components.
+    '''
+    # Apply intra prediction
+    y_predicted = DC_prediction(y)
+    u_predicted = DC_prediction(u)
+    v_predicted = DC_prediction(v)
+
+    # Get residual blocks
+    y_residual = y - y_predicted
+    u_residual = u - u_predicted
+    v_residual = v - v_predicted
+
+    yDCT, uDCT, vDCT = forward_integer_transform(y_residual), forward_integer_transform(u_residual), forward_integer_transform(v_residual)
+
+    yQuant = quantize(yDCT, width, height)
+    uQuant = quantize(uDCT, width // 2, height // 2)
+    vQuant = quantize(vDCT, width // 2, height // 2)
+
+    # Extract DC and AC coefficients; these would be transmitted to the decoder in a real MPEG
+    # encoder/decoder framework.
+    yCoeffMat = extractCoefficients(yQuant, width, height)
+    
+    dc_y, dpcm_y = getDC(yCoeffMat)
+    ac_y = getAC(yCoeffMat)
+    dccodec_y, dcencode_y = huffmanCoding(dpcm_y)
+    accodec_y, acencode_y = huffmanCoding(ac_y)
+    y_encoded = [dccodec_y,dcencode_y,accodec_y,acencode_y,yCoeffMat]
+
+    uCoeffMat = extractCoefficients(uQuant, width // 2, height // 2)
+    dc_u, dpcm_u = getDC(uCoeffMat)
+    ac_u = getAC(uCoeffMat)
+    dccodec_u, dcencode_u = huffmanCoding(dpcm_u)
+    accodec_u, acencode_u = huffmanCoding(ac_u)
+    u_encoded = [dccodec_u,dcencode_u,accodec_u,acencode_u,uCoeffMat]
+
+    vCoeffMat = extractCoefficients(vQuant, width // 2, height // 2)
+    dc_v, dpcm_v = getDC(vCoeffMat)
+    ac_v = getAC(vCoeffMat)
+    dccodec_v, dcencode_v = huffmanCoding(dpcm_v)
+    accodec_v, acencode_v= huffmanCoding(ac_v)
+    v_encoded = [dccodec_v,dcencode_v,accodec_v,acencode_v,vCoeffMat] 
+    return y_encoded,u_encoded,v_encoded
+
+@numba.jit
+def decode_I(height, width,y_encoded,u_encoded,v_encoded):
+
+    # Perform inverse quantization.
+    # decoding
+
+    dccodec_y, dcencode_y, accodec_y, acencode_y, yCoeffMat = y_encoded[0],y_encoded[1],y_encoded[2],y_encoded[3],y_encoded[4]
+    dccodec_v,dcencode_v,accodec_v,acencode_v,vCoeffMat = v_encoded[0],v_encoded[1],v_encoded[2],v_encoded[3],v_encoded[4]
+    dccodec_u,dcencode_u,accodec_u,acencode_u,uCoeffMat = u_encoded[0],u_encoded[1],u_encoded[2],u_encoded[3],u_encoded[4]
+
+    YMatRecon = MatDecode(dccodec_y, dcencode_y, accodec_y, acencode_y, yCoeffMat.shape[0])
+    YQuantRecon = IextractCoefficients(YMatRecon, width, height)
+
+    vMatRecon = MatDecode(dccodec_v,dcencode_v,accodec_v,acencode_v,vCoeffMat.shape[0])
+    vQuantRecon = IextractCoefficients(vMatRecon,width//2,height//2)
+
+    uMatRecon = MatDecode(dccodec_u,dcencode_u,accodec_u,acencode_u,uCoeffMat.shape[0])
+    uQuantRecon = IextractCoefficients(uMatRecon,width//2,height//2)
+    
+    # perform inverse quantization
+    yIQuant = quantize(YQuantRecon, width, height, isInv=True)
+    uIQuant = quantize(uQuantRecon, width // 2, height // 2, isInv=True, isLum=False)
+    vIQuant = quantize(vQuantRecon, width // 2, height // 2, isInv=True, isLum=False)
+
+    #perform inverse DCT
+    y_residual = inverse_integer_transform(yIQuant)
+    u_residual = inverse_integer_transform(uIQuant)
+    v_residual = inverse_integer_transform(vIQuant)
+    
+    # Initialize the reconstructed image
+    y_recon = np.zeros_like(y_residual)
+    u_recon = np.zeros_like(u_residual)
+    v_recon = np.zeros_like(v_residual)
+
+    # Iterate over each block in the image
+    for i in range(0, height, 4):
+        for j in range(0, width, 4):
+            # Extract the current block
+            y_block = y_residual[i:i+4, j:j+4]
+            u_block = u_residual[i:i+4, j:j+4]
+            v_block = v_residual[i:i+4, j:j+4]
+
+            # Extract the neighboring blocks
+            y_left_neighbour = y_recon[i:i+4, j-1] if j > 0 else np.zeros((4,))
+            y_top_neighbour = y_recon[i-1, j:j+4] if i > 0 else np.zeros((4,))
+            u_left_neighbour = u_recon[i:i+4, j-1] if j > 0 else np.zeros((4,))
+            u_top_neighbour = u_recon[i-1, j:j+4] if i > 0 else np.zeros((4,))
+            v_left_neighbour = v_recon[i:i+4, j-1] if j > 0 else np.zeros((4,))
+            v_top_neighbour = v_recon[i-1, j:j+4] if i > 0 else np.zeros((4,))
+
+            # Apply DC prediction and add residual
+            y_recon[i:i+4, j:j+4] = y_block + DC_prediction_block(np.zeros((4,4)), y_left_neighbour, y_top_neighbour)
+            u_recon[i:i+4, j:j+4] = u_block + DC_prediction_block(np.zeros((4,4)), u_left_neighbour, u_top_neighbour)
+            v_recon[i:i+4, j:j+4] = v_block + DC_prediction_block(np.zeros((4,4)), v_left_neighbour, v_top_neighbour)
+
+    return y_recon, u_recon, v_recon
+
+
+def main():
+    #desc = 'Showcase of image processing techniques in MPEG encoder/decoder framework.'
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--src', dest='src', required=True)
+    parser.add_argument('--size', dest='size', required=True)
+    parser.add_argument('--fps', dest='fps', required=True)
+    parser.add_argument('--dst', dest='dst', required=True)
+
+    args = parser.parse_args()
+
+    # Get arguments
+    filepath = args.src
+    width, height = map(int, args.size.split('x'))
+    fps = int(args.fps)
+    start_frame = 0
+    end_frame = 150
+    dst = args.dst
+    # print start time
+    print('Start time: ' + str(datetime.datetime.now()))
+    frames, num_frame = extractYUV(filepath, height, width)
+    print('End time: ' + str(datetime.datetime.now()))
+
+    video = cv.VideoWriter(dst, cv.VideoWriter_fourcc(*'XVID'), fps, (width, height))
+    k = 0
+    i = 0
+    PSNR = []
+    encoded_file_size=0
+    y_encoded_frames, u_encoded_frames, v_encoded_frames, MV_encoded_frames, MV_sub_array_encoded_frames = [], [], [], [], []
+
+
+    for frame_num in range(len(frames)):
+        curr = frames[frame_num]
+        if curr is None:
+            continue
+        yCurr, uCurr, vCurr = curr['y'], curr['u'], curr['v']
+        if frame_num % 2 == 0:
+            print("[I] compressing frame " + str(frame_num))
+
+            y_encoded, u_encoded, v_encoded = encode_I(yCurr, uCurr, vCurr, height, width)
+            y_encoded_frames.append(y_encoded)
+            u_encoded_frames.append(u_encoded)
+            v_encoded_frames.append(v_encoded)
+            MV_encoded_frames.append(0)
+            MV_sub_array_encoded_frames.append(0)
+            for i in range(len(y_encoded)):
+                if i==1 or i==3:
+                    encoded_file_size=encoded_file_size+len(y_encoded[i])+len(u_encoded[i])+len(v_encoded[i])
+
+            # re_rgb = YUV2RGB(y_encoded.astype(np.uint8),u_encoded.astype(np.uint8), v_encoded.astype(np.uint8), height, width)
+            y_ref = yCurr
+            u_ref = uCurr
+            v_ref = vCurr
+
+        else:
+            print("[P] compressing frame " + str(frame_num))
+
+            # Do motion estimatation using the I-frame as the reference frame for the current frame in the loop.python mpeg.py --file 'walk_qcif.avi' --extract 6 10
+            coordMat, MV_arr, MV_subarr, yPred, uPred, vPred = motionEstimation(yCurr,y_ref, u_ref, v_ref, width,height)
+
+            yTmp, uTmp, vTmp = yPred, uPred, vPred
+
+            # Get residual frame
+            yDiff = yCurr.astype(np.uint8) - yTmp.astype(np.uint8)
+            uDiff = uCurr.astype(np.uint8) - uTmp.astype(np.uint8)
+            vDiff = vCurr.astype(np.uint8) - vTmp.astype(np.uint8)
+
+            y_encoded, u_encoded, v_encoded ,MV_encoded, MV_subarr_encoded = encode(yDiff, uDiff, vDiff, height, width,MV_arr,MV_subarr)
+            y_encoded_frames.append(y_encoded)
+            u_encoded_frames.append(u_encoded)
+            v_encoded_frames.append(v_encoded)
+            MV_encoded_frames.append(MV_encoded)
+            MV_sub_array_encoded_frames.append(MV_subarr_encoded)
+
+
+            for i in range(len(y_encoded)):
+                if i==1 or i==3:
+                    encoded_file_size=encoded_file_size+len(y_encoded[i])+len(u_encoded[i])+len(v_encoded[i])     
+            
+            k += 1
+            re_rgb = YUV2RGB(yCurr.astype(np.uint8),uCurr.astype(np.uint8),vCurr.astype(np.uint8), height, width)
+            diffMat = YUV2RGB(yDiff,uDiff,vDiff,height,width) 
+            pred_rgb = YUV2RGB(yPred, uPred, vPred, height, width)
+            # plot 
+            plt.figure(figsize=(10, 10))
+            curr = YUV2RGB(yCurr, uCurr, vCurr, height, width)
+            curr_plt = cv.cvtColor(curr, cv.COLOR_BGR2RGB)
+            re_rgb_plt = cv.cvtColor(re_rgb, cv.COLOR_BGR2RGB)
+            pred_rgb_plt = cv.cvtColor(pred_rgb, cv.COLOR_BGR2RGB)
+            # diffMat_plt = cv.cvtColor(diffMat, cv.COLOR_BGR2RGB)
+            plt.subplot(2, 2, 1).set_title('Current Image'), plt.imshow(curr_plt)
+            plt.subplot(2, 2, 3).set_title('Differential Image'), plt.imshow(yDiff)
+            plt.subplot(2, 2, 2).set_title('Predicted Image'), plt.imshow(pred_rgb_plt)
+            plt.subplot(2, 2, 4).set_title('Motion Vectors'), plt.quiver(coordMat[0, :], coordMat[1, :], coordMat[2, :],
+                                                                        coordMat[3, :])
+            plt.savefig('H264_result/train_'+str(k)+'.png')     
+            plt.close()      
+
+    print(encoded_file_size)
+    ## Decoding
+    i=0
+    for frame_num in range(len(v_encoded_frames)):
+        y_encoded, u_encoded, v_encoded, MV_encoded,MV_sub_array_encoded = y_encoded_frames[frame_num], u_encoded_frames[frame_num], v_encoded_frames[frame_num], MV_encoded_frames[frame_num],MV_sub_array_encoded_frames[frame_num] 
+        if frame_num % 2 == 0:
+            y_decoded, u_decoded, v_decoded = decode_I(height,width,y_encoded,u_encoded,v_encoded)
+            re_rgb = YUV2RGB(y_decoded.astype(np.uint8),u_decoded.astype(np.uint8), v_decoded.astype(np.uint8), height, width)
+            y_ref = y_decoded
+            u_ref = u_decoded
+            v_ref = v_decoded
+
+        else:
+            y_diff, u_diff, v_diff, MV_decoded,MV_sub_array_decoded = decode(height,width,y_encoded,u_encoded,v_encoded,MV_encoded,MV_sub_array_encoded)
+            # yCurr, uCurr, vCurr = y_diff, u_diff, v_diff
+            
+            MV_decoded = np.reshape(MV_decoded, (2,int(len(MV_decoded)/2)))
+            MV_sub_array_decoded = np.reshape(MV_sub_array_decoded, (2,int(len(MV_sub_array_decoded)/2)))
+            mv_idx = 0
+            y_Pred = np.zeros((height, width))
+            u_Pred = np.zeros((height // 2, width // 2))
+            v_Pred = np.zeros((height // 2, width // 2))
+            for n, m in product(range(0, height, 16), range(0, width, 16)):
+                for i in range(16):
+                    for j in range(16):
+                        interpolated_value = bilinear_interpolation(y_ref, MV_decoded[1, mv_idx] + m + j, MV_decoded[0, mv_idx]+n + i)
+                        y_Pred[n + i, m + j] = np.float32(interpolated_value)
+
+            uv_idx = 0
+            for i, j in product(range(0, (height // 2), 8), range(0, (width // 2), 8)):
+
+                    ref_row = int(i + (MV_sub_array_decoded[0, uv_idx]))
+                    ref_col = int(j + (MV_sub_array_decoded[1, uv_idx]))
+
+                    u_Pred[i:i + 8, j:j + 8] = bilinear_interpolation(u_ref, ref_col, ref_row)
+                    v_Pred[i:i + 8, j:j + 8] = bilinear_interpolation(v_ref, ref_col, ref_row)
+
+                    uv_idx += 1
+
+
+            yCurr = y_diff.astype(np.uint8) + y_Pred.astype(np.uint8)
+            uCurr = u_diff.astype(np.uint8) + u_Pred.astype(np.uint8)
+            vCurr = v_diff.astype(np.uint8) + v_Pred.astype(np.uint8)
+
+            # i += 1
+            re_rgb = YUV2RGB(yCurr.astype(np.uint8),uCurr.astype(np.uint8),vCurr.astype(np.uint8), height, width)
+
+
+        video.write(re_rgb)  
+    plt.title('PSNR per Frame')
+    plt.ylim([50, 100])
+    plt.plot(PSNR)
+    plt.show()
+
+if __name__ == '__main__':
+    main()
